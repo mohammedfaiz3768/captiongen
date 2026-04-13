@@ -1,5 +1,7 @@
 import { NextRequest, NextResponse } from "next/server";
 
+export const maxDuration = 60; // seconds — Vercel Pro/hobby max for API routes
+
 export async function POST(req: NextRequest) {
   try {
     const formData = await req.formData();
