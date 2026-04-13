@@ -1,13 +1,26 @@
 import type { Caption, CaptionTemplate } from "@/types";
+import { Muxer, ArrayBufferTarget } from "mp4-muxer";
 
 export type ExportResolution = "1080p" | "1440p" | "4k";
 export type ExportFPS = 30 | 60;
 
-export const EXPORT_RESOLUTIONS: Record<ExportResolution, { width: number; height: number; bitrate: number; label: string }> = {
-  "1080p": { width: 1920,  height: 1080,  bitrate: 12_000_000, label: "1080p Full HD" },
-  "1440p": { width: 2560,  height: 1440,  bitrate: 24_000_000, label: "1440p 2K" },
-  "4k":    { width: 3840,  height: 2160,  bitrate: 80_000_000, label: "4K Ultra HD" },
+export const EXPORT_RESOLUTIONS: Record<ExportResolution, { maxLongSide: number; bitrate: number; label: string }> = {
+  "1080p": { maxLongSide: 1920,  bitrate: 12_000_000, label: "1080p Full HD" },
+  "1440p": { maxLongSide: 2560,  bitrate: 24_000_000, label: "1440p 2K" },
+  "4k":    { maxLongSide: 3840,  bitrate: 80_000_000, label: "4K Ultra HD" },
 };
+
+/** Compute canvas dimensions preserving the video's actual aspect ratio. */
+function computeDimensions(videoEl: HTMLVideoElement, maxLongSide: number) {
+  const vw = videoEl.videoWidth  || 1920;
+  const vh = videoEl.videoHeight || 1080;
+  const aspect = vw / vh;
+  let w: number, h: number;
+  if (aspect >= 1) { w = maxLongSide; h = Math.round(maxLongSide / aspect); }
+  else             { h = maxLongSide; w = Math.round(maxLongSide * aspect); }
+  // H.264 requires even dimensions
+  return { w: w % 2 === 0 ? w : w - 1, h: h % 2 === 0 ? h : h - 1 };
+}
 
 // ── Canvas caption renderer ───────────────────────────────────────────────────
 
@@ -17,7 +30,7 @@ function parsePx(val: string | number | undefined, fallback = 0): number {
   return isNaN(n) ? fallback : n;
 }
 
-function parsePadding(pad: string | undefined): { top: number; right: number; bottom: number; left: number } {
+function parsePadding(pad: string | undefined) {
   if (!pad) return { top: 10, right: 20, bottom: 10, left: 20 };
   const parts = pad.trim().split(/\s+/).map(parsePx);
   if (parts.length === 1) return { top: parts[0], right: parts[0], bottom: parts[0], left: parts[0] };
@@ -34,7 +47,6 @@ function getCSSColor(style: Record<string, unknown>): string {
 
 function applyShadow(ctx: CanvasRenderingContext2D, shadow: string | undefined, scale: number) {
   if (!shadow) return;
-  // parse first shadow segment only
   const m = shadow.match(/(-?\d+(?:\.\d+)?)px\s+(-?\d+(?:\.\d+)?)px\s+(?:(-?\d+(?:\.\d+)?)px\s+)?(.+?)(?:,|$)/);
   if (!m) return;
   ctx.shadowOffsetX = parseFloat(m[1]) * scale;
@@ -44,10 +56,8 @@ function applyShadow(ctx: CanvasRenderingContext2D, shadow: string | undefined, 
 }
 
 function clearShadow(ctx: CanvasRenderingContext2D) {
-  ctx.shadowOffsetX = 0;
-  ctx.shadowOffsetY = 0;
-  ctx.shadowBlur    = 0;
-  ctx.shadowColor   = "transparent";
+  ctx.shadowOffsetX = 0; ctx.shadowOffsetY = 0;
+  ctx.shadowBlur = 0;    ctx.shadowColor = "transparent";
 }
 
 function buildFont(textStyle: Record<string, unknown>, fontSize: number): string {
@@ -69,8 +79,8 @@ export function drawCaptionFrame(
 ) {
   const scale = (canvasW / 1920) * userScale;
 
-  const ts  = template.textStyle  as Record<string, unknown>;
-  const cs  = template.containerStyle as Record<string, unknown>;
+  const ts  = template.textStyle        as Record<string, unknown>;
+  const cs  = template.containerStyle   as Record<string, unknown>;
   const aws = (template.activeWordStyle   ?? {}) as Record<string, unknown>;
   const iws = (template.inactiveWordStyle ?? {}) as Record<string, unknown>;
 
@@ -81,7 +91,6 @@ export function drawCaptionFrame(
   ctx.font = buildFont(ts, baseFontSize);
   ctx.textBaseline = "middle";
 
-  // ── Build word list ───────────────────────────────────────────────────────
   type WR = { text: string; color: string; shadow?: string; scaleUp: number };
   let wordList: WR[] = [];
 
@@ -98,12 +107,10 @@ export function drawCaptionFrame(
     wordList = [{ text: process(caption.text), color: getCSSColor(ts), shadow: ts.textShadow as string, scaleUp: 1 }];
   }
 
-  // ── Measure + wrap ────────────────────────────────────────────────────────
-  const gap    = 6 * scale;
-  const pad    = parsePadding(cs.padding as string);
-  const padX   = ((pad.left + pad.right) / 2) * scale;
-  const padY   = ((pad.top  + pad.bottom) / 2) * scale;
-  const maxW   = canvasW * 0.9 - padX * 2;
+  const pad  = parsePadding(cs.padding as string);
+  const padX = ((pad.left + pad.right) / 2) * scale;
+  const padY = ((pad.top  + pad.bottom) / 2) * scale;
+  const maxW = canvasW * 0.9 - padX * 2;
 
   const measured = wordList.map(w => ({ ...w, w: ctx.measureText(w.text + " ").width }));
 
@@ -116,12 +123,11 @@ export function drawCaptionFrame(
   }
   if (cur.length > 0) lines.push(cur);
 
-  const lineH  = baseFontSize * 1.4;
-  const boxH   = lines.length * lineH + padY * 2;
-  const boxW   = Math.min(canvasW * 0.9,
+  const lineH = baseFontSize * 1.4;
+  const boxH  = lines.length * lineH + padY * 2;
+  const boxW  = Math.min(canvasW * 0.9,
     Math.max(...lines.map(l => l.reduce((s, w) => s + w.w, 0))) + padX * 2);
 
-  // ── Position ──────────────────────────────────────────────────────────────
   let cx: number, cy: number;
   if (customPosition) {
     cx = (customPosition.x / 100) * canvasW;
@@ -138,7 +144,6 @@ export function drawCaptionFrame(
   const bx = cx - boxW / 2;
   const by = cy - boxH / 2;
 
-  // ── Draw background ───────────────────────────────────────────────────────
   const bg = (cs.background ?? cs.backgroundColor) as string | undefined;
   if (bg && !bg.startsWith("linear-gradient")) {
     const br = parsePx(cs.borderRadius as string, 0) * scale;
@@ -151,37 +156,222 @@ export function drawCaptionFrame(
     ctx.restore();
   }
 
-  // ── Draw words ────────────────────────────────────────────────────────────
   let ly = by + padY + lineH / 2;
   for (const line of lines) {
     const lTotal = line.reduce((s, w) => s + w.w, 0);
     let lx = cx - lTotal / 2;
-
     for (const word of line) {
       ctx.save();
       ctx.font = buildFont(ts, baseFontSize);
       ctx.textBaseline = "middle";
-
       if (word.scaleUp !== 1) {
         const wx = lx + word.w / 2;
-        ctx.translate(wx, ly);
-        ctx.scale(word.scaleUp, word.scaleUp);
-        ctx.translate(-wx, -ly);
+        ctx.translate(wx, ly); ctx.scale(word.scaleUp, word.scaleUp); ctx.translate(-wx, -ly);
       }
-
       applyShadow(ctx, word.shadow, scale);
       ctx.fillStyle = word.color;
       ctx.fillText(word.text, lx, ly);
       clearShadow(ctx);
       ctx.restore();
-
       lx += word.w;
     }
     ly += lineH;
   }
 }
 
-// ── Main export function ──────────────────────────────────────────────────────
+// ── MP4 export via WebCodecs + mp4-muxer ─────────────────────────────────────
+
+async function exportMP4(
+  videoEl: HTMLVideoElement,
+  captions: Caption[],
+  template: CaptionTemplate,
+  captionScale: number,
+  captionPosition: { x: number; y: number } | null,
+  outW: number,
+  outH: number,
+  fps: ExportFPS,
+  bitrate: number,
+  onProgress: (pct: number) => void,
+  signal: AbortSignal
+): Promise<Blob> {
+  const canvas = document.createElement("canvas");
+  canvas.width  = outW;
+  canvas.height = outH;
+  const ctx = canvas.getContext("2d", { willReadFrequently: true })!;
+
+  // ── Decode audio upfront ──────────────────────────────────────────────────
+  let audioBuffer: AudioBuffer | null = null;
+  try {
+    const resp = await fetch(videoEl.src);
+    const ab   = await resp.arrayBuffer();
+    const actx = new AudioContext();
+    audioBuffer = await actx.decodeAudioData(ab);
+    await actx.close();
+  } catch {
+    // no audio or decode failed — export video-only
+  }
+
+  // ── Muxer ─────────────────────────────────────────────────────────────────
+  const muxer = new Muxer({
+    target: new ArrayBufferTarget(),
+    video: { codec: "avc", width: outW, height: outH },
+    ...(audioBuffer ? {
+      audio: {
+        codec: "aac",
+        sampleRate: audioBuffer.sampleRate,
+        numberOfChannels: audioBuffer.numberOfChannels,
+      }
+    } : {}),
+    fastStart: "in-memory",
+  });
+
+  // ── Video encoder ─────────────────────────────────────────────────────────
+  const level  = outW >= 3840 || outH >= 3840 ? "34" : outW >= 2560 || outH >= 2560 ? "33" : "32";
+  const videoEncoder = new VideoEncoder({
+    output: (chunk, meta) => muxer.addVideoChunk(chunk, meta!),
+    error:  (e) => { throw e; },
+  });
+  videoEncoder.configure({
+    codec: `avc1.6400${level}`,
+    width: outW, height: outH,
+    bitrate, framerate: fps,
+    latencyMode: "quality",
+  });
+
+  // ── Audio encoder + feed all audio ───────────────────────────────────────
+  if (audioBuffer) {
+    const audioEncoder = new AudioEncoder({
+      output: (chunk, meta) => muxer.addAudioChunk(chunk, meta!),
+      error:  (e) => { throw e; },
+    });
+    audioEncoder.configure({
+      codec: "mp4a.40.2",
+      sampleRate: audioBuffer.sampleRate,
+      numberOfChannels: audioBuffer.numberOfChannels,
+      bitrate: 192_000,
+    });
+
+    const SR      = audioBuffer.sampleRate;
+    const CHUNK   = 4096;
+    const nch     = audioBuffer.numberOfChannels;
+    const chData  = Array.from({ length: nch }, (_, c) => audioBuffer!.getChannelData(c));
+
+    for (let i = 0; i < audioBuffer.length; i += CHUNK) {
+      const count = Math.min(CHUNK, audioBuffer.length - i);
+      const plane = new Float32Array(count * nch);
+      for (let c = 0; c < nch; c++) plane.set(chData[c].subarray(i, i + count), c * count);
+      const ad = new AudioData({
+        format: "f32-planar",
+        sampleRate: SR,
+        numberOfFrames: count,
+        numberOfChannels: nch,
+        timestamp: Math.round((i / SR) * 1_000_000),
+        data: plane,
+      });
+      audioEncoder.encode(ad);
+      ad.close();
+    }
+    await audioEncoder.flush();
+  }
+
+  // ── Seek-based frame loop ─────────────────────────────────────────────────
+  const duration      = videoEl.duration || 1;
+  const frameInterval = 1 / fps;
+  let   frameIdx      = 0;
+
+  const seekTo = (t: number) =>
+    new Promise<void>((res) => { videoEl.currentTime = t; videoEl.addEventListener("seeked", () => res(), { once: true }); });
+
+  await seekTo(0);
+
+  for (let t = 0; t <= duration + frameInterval / 2; t += frameInterval) {
+    if (signal.aborted) throw new DOMException("Aborted", "AbortError");
+
+    await seekTo(Math.min(t, duration));
+
+    ctx.drawImage(videoEl, 0, 0, outW, outH);
+    const cap = captions.find(c => t >= c.start && t <= c.end) ?? null;
+    if (cap) drawCaptionFrame(ctx, outW, outH, cap, template, t, captionScale, captionPosition);
+
+    const ts_us  = Math.round(t * 1_000_000);
+    const dur_us = Math.round(frameInterval * 1_000_000);
+    const frame  = new VideoFrame(canvas, { timestamp: ts_us, duration: dur_us });
+    videoEncoder.encode(frame, { keyFrame: frameIdx % (fps * 2) === 0 });
+    frame.close();
+    frameIdx++;
+
+    onProgress(Math.min(98, (t / duration) * 100));
+  }
+
+  await videoEncoder.flush();
+  muxer.finalize();
+
+  const { buffer } = muxer.target as ArrayBufferTarget;
+  return new Blob([buffer], { type: "video/mp4" });
+}
+
+// ── WebM fallback via MediaRecorder ──────────────────────────────────────────
+
+async function exportWebM(
+  videoEl: HTMLVideoElement,
+  captions: Caption[],
+  template: CaptionTemplate,
+  captionScale: number,
+  captionPosition: { x: number; y: number } | null,
+  outW: number,
+  outH: number,
+  fps: ExportFPS,
+  bitrate: number,
+  onProgress: (pct: number) => void,
+  signal: AbortSignal
+): Promise<Blob> {
+  const canvas = document.createElement("canvas");
+  canvas.width  = outW;
+  canvas.height = outH;
+  const ctx = canvas.getContext("2d")!;
+
+  const rawStream    = (videoEl as unknown as { captureStream?(): MediaStream }).captureStream?.();
+  const canvasStream = canvas.captureStream(fps);
+  rawStream?.getAudioTracks().forEach(t => canvasStream.addTrack(t.clone()));
+
+  const mimeType = ["video/webm;codecs=vp9,opus", "video/webm;codecs=vp8,opus", "video/webm"]
+    .find(m => MediaRecorder.isTypeSupported(m)) ?? "video/webm";
+
+  const recorder = new MediaRecorder(canvasStream, { mimeType, videoBitsPerSecond: bitrate });
+  const chunks: Blob[] = [];
+  recorder.ondataavailable = e => { if (e.data.size > 0) chunks.push(e.data); };
+
+  return new Promise((resolve, reject) => {
+    let rafId = 0;
+    const duration = videoEl.duration || 1;
+    const stop = () => { cancelAnimationFrame(rafId); if (recorder.state !== "inactive") recorder.stop(); };
+    recorder.onstop  = () => resolve(new Blob(chunks, { type: mimeType }));
+    recorder.onerror = () => reject(new Error("MediaRecorder error"));
+    signal.addEventListener("abort", () => { stop(); reject(new DOMException("Aborted", "AbortError")); });
+
+    const drawLoop = () => {
+      if (signal.aborted) return;
+      const t = videoEl.currentTime;
+      onProgress(Math.min(98, (t / duration) * 100));
+      ctx.drawImage(videoEl, 0, 0, outW, outH);
+      const cap = captions.find(c => t >= c.start && t <= c.end) ?? null;
+      if (cap) drawCaptionFrame(ctx, outW, outH, cap, template, t, captionScale, captionPosition);
+      if (!videoEl.ended) rafId = requestAnimationFrame(drawLoop);
+      else { stop(); onProgress(100); }
+    };
+
+    recorder.start(100);
+    videoEl.currentTime = 0;
+    videoEl.play().then(() => { rafId = requestAnimationFrame(drawLoop); }).catch(reject);
+    videoEl.onended = () => { stop(); onProgress(100); };
+  });
+}
+
+// ── Public API ────────────────────────────────────────────────────────────────
+
+export function canExportMP4(): boolean {
+  return typeof VideoEncoder !== "undefined" && typeof AudioEncoder !== "undefined";
+}
 
 export async function exportVideoWithCaptions(
   videoEl: HTMLVideoElement,
@@ -193,72 +383,15 @@ export async function exportVideoWithCaptions(
   fps: ExportFPS,
   onProgress: (pct: number) => void,
   signal: AbortSignal
-): Promise<Blob> {
+): Promise<{ blob: Blob; ext: string }> {
   const res = EXPORT_RESOLUTIONS[resolution];
+  const { w: outW, h: outH } = computeDimensions(videoEl, res.maxLongSide);
 
-  const canvas = document.createElement("canvas");
-  canvas.width  = res.width;
-  canvas.height = res.height;
-  const ctx = canvas.getContext("2d")!;
+  if (canExportMP4()) {
+    const blob = await exportMP4(videoEl, captions, template, captionScale, captionPosition, outW, outH, fps, res.bitrate, onProgress, signal);
+    return { blob, ext: "mp4" };
+  }
 
-  // Grab audio track from the video element's stream
-  const rawStream = (videoEl as unknown as { captureStream?(): MediaStream }).captureStream?.();
-  const canvasStream = canvas.captureStream(fps);
-  rawStream?.getAudioTracks().forEach(t => canvasStream.addTrack(t.clone()));
-
-  const mimeTypes = [
-    `video/webm;codecs=vp9,opus`,
-    `video/webm;codecs=vp8,opus`,
-    `video/webm`,
-    `video/mp4`,
-  ];
-  const mimeType = mimeTypes.find(m => MediaRecorder.isTypeSupported(m)) ?? "video/webm";
-
-  const recorder = new MediaRecorder(canvasStream, {
-    mimeType,
-    videoBitsPerSecond: res.bitrate,
-  });
-
-  const chunks: Blob[] = [];
-  recorder.ondataavailable = e => { if (e.data.size > 0) chunks.push(e.data); };
-
-  return new Promise((resolve, reject) => {
-    let rafId = 0;
-    const duration = videoEl.duration || 1;
-
-    const stop = () => {
-      cancelAnimationFrame(rafId);
-      if (recorder.state !== "inactive") recorder.stop();
-    };
-
-    recorder.onstop = () => {
-      const blob = new Blob(chunks, { type: mimeType });
-      resolve(blob);
-    };
-    recorder.onerror = () => reject(new Error("MediaRecorder error"));
-
-    signal.addEventListener("abort", () => { stop(); reject(new DOMException("Aborted", "AbortError")); });
-
-    const drawLoop = () => {
-      if (signal.aborted) return;
-
-      const t = videoEl.currentTime;
-      onProgress(Math.min(99, (t / duration) * 100));
-
-      // Draw video frame upscaled to target resolution
-      ctx.drawImage(videoEl, 0, 0, res.width, res.height);
-
-      // Find and draw caption
-      const cap = captions.find(c => t >= c.start && t <= c.end) ?? null;
-      if (cap) drawCaptionFrame(ctx, res.width, res.height, cap, template, t, captionScale, captionPosition);
-
-      if (!videoEl.ended) rafId = requestAnimationFrame(drawLoop);
-      else { stop(); onProgress(100); }
-    };
-
-    recorder.start(100); // collect chunks every 100ms
-    videoEl.currentTime = 0;
-    videoEl.play().then(() => { rafId = requestAnimationFrame(drawLoop); }).catch(reject);
-    videoEl.onended = () => { stop(); onProgress(100); };
-  });
+  const blob = await exportWebM(videoEl, captions, template, captionScale, captionPosition, outW, outH, fps, res.bitrate, onProgress, signal);
+  return { blob, ext: "webm" };
 }

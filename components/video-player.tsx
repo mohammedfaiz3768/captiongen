@@ -41,6 +41,7 @@ export default function VideoPlayer({
   const videoRef = useRef<HTMLVideoElement>(null);
   const containerRef = useRef<HTMLDivElement>(null);
   const [controlsVisible, setControlsVisible] = useState(false);
+  const [videoRatio, setVideoRatio] = useState<number | null>(null);
   const hideTimeout = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   const {
@@ -90,10 +91,18 @@ export default function VideoPlayer({
 
   const seekPercent = duration > 0 ? (currentTime / duration) * 100 : 0;
 
+  const isVertical = videoRatio !== null && videoRatio < 1;
+
   return (
+    <div className={isVertical ? "flex justify-center" : ""}>
     <div
       ref={containerRef}
-      className="relative rounded-xl overflow-hidden bg-black aspect-video group"
+      className="relative rounded-xl overflow-hidden bg-black group"
+      style={{
+        aspectRatio: videoRatio ?? 16 / 9,
+        ...(isVertical && { maxWidth: "min(400px, 100%)" }),
+        width: "100%",
+      }}
       data-video-container
       onMouseMove={showControls}
       onMouseEnter={showControls}
@@ -121,7 +130,12 @@ export default function VideoPlayer({
         src={videoUrl}
         className="w-full h-full object-contain"
         onClick={handleVideoClick}
-        onLoadedMetadata={() => { if (videoRef.current) onVideoReady?.(videoRef.current); }}
+        onLoadedMetadata={() => {
+          if (videoRef.current) {
+            setVideoRatio(videoRef.current.videoWidth / videoRef.current.videoHeight);
+            onVideoReady?.(videoRef.current);
+          }
+        }}
         playsInline
         preload="metadata"
       />
@@ -231,6 +245,7 @@ export default function VideoPlayer({
           </div>
         </button>
       )}
+    </div>
     </div>
   );
 }

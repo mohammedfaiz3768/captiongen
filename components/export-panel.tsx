@@ -24,6 +24,7 @@ import {
 } from "@/lib/export-formats";
 import {
   exportVideoWithCaptions,
+  canExportMP4,
   EXPORT_RESOLUTIONS,
   type ExportResolution,
   type ExportFPS,
@@ -115,7 +116,7 @@ export default function ExportPanel({
     setExportProgress(0);
 
     try {
-      const blob = await exportVideoWithCaptions(
+      const { blob, ext } = await exportVideoWithCaptions(
         videoEl,
         captions,
         selectedTemplate,
@@ -130,10 +131,10 @@ export default function ExportPanel({
       const url = URL.createObjectURL(blob);
       const a = document.createElement("a");
       a.href = url;
-      a.download = `captions-${resolution}-${fps}fps.webm`;
+      a.download = `captions-${resolution}-${fps}fps.${ext}`;
       a.click();
       URL.revokeObjectURL(url);
-      toast.success(`Video exported at ${EXPORT_RESOLUTIONS[resolution].label} ${fps}fps`);
+      toast.success(`Video exported as .${ext} — ${EXPORT_RESOLUTIONS[resolution].label} ${fps}fps`);
     } catch (err) {
       if (err instanceof DOMException && err.name === "AbortError") {
         toast.info("Export cancelled.");
@@ -175,7 +176,9 @@ export default function ExportPanel({
         <div className="flex items-center gap-2 mb-4">
           <Film size={16} className="text-indigo-400" />
           <h2 className="text-sm font-semibold text-zinc-200">Export Video with Captions</h2>
-          <span className="ml-auto text-[10px] bg-indigo-500/20 text-indigo-400 px-2 py-0.5 rounded-full font-medium">BURN IN</span>
+          <span className="ml-auto text-[10px] bg-indigo-500/20 text-indigo-400 px-2 py-0.5 rounded-full font-medium">
+            {canExportMP4() ? "MP4" : "WEBM"}
+          </span>
         </div>
 
         {/* Resolution picker */}
@@ -251,12 +254,14 @@ export default function ExportPanel({
             className="w-full bg-gradient-to-r from-indigo-500 to-violet-600 hover:from-indigo-400 hover:to-violet-500 text-white font-semibold h-10 shadow-lg shadow-indigo-500/20"
           >
             <Film size={15} className="mr-2" />
-            Export {EXPORT_RESOLUTIONS[resolution].label} · {fps} fps
+            Export {EXPORT_RESOLUTIONS[resolution].label} · {fps}fps · {canExportMP4() ? "MP4" : "WebM"}
           </Button>
         )}
 
         <p className="text-[10px] text-zinc-600 mt-2">
-          Captions are rendered directly into the video. Output is a .webm file (open in VLC or Chrome).
+          {canExportMP4()
+            ? "Captions burned in as H.264 MP4 — plays everywhere."
+            : "WebM fallback (Chrome/Firefox). For MP4, use Chrome 94+."}
         </p>
       </div>
 
