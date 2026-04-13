@@ -181,6 +181,26 @@ export function drawCaptionFrame(
 
 // ── MP4 export via WebCodecs + mp4-muxer ─────────────────────────────────────
 
+/** Try codec configs from high to low until one is supported. */
+async function resolveVideoCodec(outW: number, outH: number, bitrate: number, fps: ExportFPS) {
+  const candidates = [
+    `avc1.640034`, // High Profile Level 5.2
+    `avc1.640033`, // High Profile Level 5.1
+    `avc1.640032`, // High Profile Level 5.0
+    `avc1.4d0034`, // Main Profile Level 5.2
+    `avc1.4d0032`, // Main Profile Level 5.0
+    `avc1.420034`, // Baseline Level 5.2
+    `avc1.42002a`, // Baseline Level 4.2
+  ];
+  for (const codec of candidates) {
+    try {
+      const support = await VideoEncoder.isConfigSupported({ codec, width: outW, height: outH, bitrate, framerate: fps });
+      if (support.supported) return codec;
+    } catch { /* try next */ }
+  }
+  return null; // no H.264 support
+}
+
 async function exportMP4(
   videoEl: HTMLVideoElement,
   captions: Caption[],
@@ -194,6 +214,10 @@ async function exportMP4(
   onProgress: (pct: number) => void,
   signal: AbortSignal
 ): Promise<Blob> {
+  // Verify a working codec config exists before doing any work
+  const codec = await resolveVideoCodec(outW, outH, bitrate, fps);
+  if (!codec) throw new Error("No supported H.264 codec found on this device.");
+
   const canvas = document.createElement("canvas");
   canvas.width  = outW;
   canvas.height = outH;
@@ -207,9 +231,7 @@ async function exportMP4(
     const actx = new AudioContext();
     audioBuffer = await actx.decodeAudioData(ab);
     await actx.close();
-  } catch {
-    // no audio or decode failed — export video-only
-  }
+  } catch { /* no audio — continue video-only */ }
 
   // ── Muxer ─────────────────────────────────────────────────────────────────
   const muxer = new Muxer({
@@ -226,23 +248,19 @@ async function exportMP4(
   });
 
   // ── Video encoder ─────────────────────────────────────────────────────────
-  const level  = outW >= 3840 || outH >= 3840 ? "34" : outW >= 2560 || outH >= 2560 ? "33" : "32";
+  // eslint-disable-next-line prefer-const
+  let encoderError: DOMException | null = null;
   const videoEncoder = new VideoEncoder({
     output: (chunk, meta) => muxer.addVideoChunk(chunk, meta!),
-    error:  (e) => { throw e; },
+    error:  (e) => { encoderError = e; },
   });
-  videoEncoder.configure({
-    codec: `avc1.6400${level}`,
-    width: outW, height: outH,
-    bitrate, framerate: fps,
-    latencyMode: "quality",
-  });
+  videoEncoder.configure({ codec, width: outW, height: outH, bitrate });
 
   // ── Audio encoder + feed all audio ───────────────────────────────────────
   if (audioBuffer) {
     const audioEncoder = new AudioEncoder({
       output: (chunk, meta) => muxer.addAudioChunk(chunk, meta!),
-      error:  (e) => { throw e; },
+      error:  (e) => { encoderError = e; },
     });
     audioEncoder.configure({
       codec: "mp4a.40.2",
@@ -280,12 +298,21 @@ async function exportMP4(
   let   frameIdx      = 0;
 
   const seekTo = (t: number) =>
-    new Promise<void>((res) => { videoEl.currentTime = t; videoEl.addEventListener("seeked", () => res(), { once: true }); });
+    new Promise<void>((res) => {
+      videoEl.currentTime = t;
+      videoEl.addEventListener("seeked", () => res(), { once: true });
+    });
 
   await seekTo(0);
 
   for (let t = 0; t <= duration + frameInterval / 2; t += frameInterval) {
     if (signal.aborted) throw new DOMException("Aborted", "AbortError");
+    if (encoderError)   throw new Error(`Encoder error: ${(encoderError as DOMException).message}`);
+
+    // Throttle: don't let the queue grow beyond 20 frames
+    while (videoEncoder.encodeQueueSize > 20) {
+      await new Promise(r => setTimeout(r, 10));
+    }
 
     await seekTo(Math.min(t, duration));
 
@@ -304,6 +331,8 @@ async function exportMP4(
   }
 
   await videoEncoder.flush();
+  if (encoderError) throw new Error(`Encoder error: ${String(encoderError)}`);
+
   muxer.finalize();
 
   const { buffer } = muxer.target as ArrayBufferTarget;
@@ -388,8 +417,15 @@ export async function exportVideoWithCaptions(
   const { w: outW, h: outH } = computeDimensions(videoEl, res.maxLongSide);
 
   if (canExportMP4()) {
-    const blob = await exportMP4(videoEl, captions, template, captionScale, captionPosition, outW, outH, fps, res.bitrate, onProgress, signal);
-    return { blob, ext: "mp4" };
+    try {
+      const blob = await exportMP4(videoEl, captions, template, captionScale, captionPosition, outW, outH, fps, res.bitrate, onProgress, signal);
+      return { blob, ext: "mp4" };
+    } catch (e) {
+      // If aborted, rethrow
+      if (e instanceof DOMException && e.name === "AbortError") throw e;
+      // Otherwise fall through to WebM
+      console.warn("MP4 export failed, falling back to WebM:", e);
+    }
   }
 
   const blob = await exportWebM(videoEl, captions, template, captionScale, captionPosition, outW, outH, fps, res.bitrate, onProgress, signal);
