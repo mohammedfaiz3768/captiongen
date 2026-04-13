@@ -1,36 +1,101 @@
-This is a [Next.js](https://nextjs.org) project bootstrapped with [`create-next-app`](https://nextjs.org/docs/app/api-reference/cli/create-next-app).
+# CaptionGen — AI Video Caption Generator
 
-## Getting Started
+Generate professional captions for your videos using Groq Whisper AI. Supports Hindi, Hinglish, and 12+ languages with 10 stunning caption templates.
 
-First, run the development server:
+## Features
+
+- **AI Transcription** — Powered by Groq Whisper large-v3, the fastest and most accurate speech-to-text
+- **Hinglish & 12 Languages** — Hindi, Urdu, Tamil, Telugu, Bengali, Marathi, Gujarati, Kannada, Malayalam, Punjabi, Arabic, English
+- **10 Caption Templates** — Clean Classic, CapCut Viral, Neon Nights, Gradient Wave, Minimal Pill, Karaoke Sync, Street Impact, Boxed Words, Handwritten, Cinema Scope
+- **Word-by-Word Sync** — 4 templates with real-time word highlighting as speech plays
+- **Caption Editor** — Edit text, adjust timestamps, merge, split, and reorder captions
+- **Multi-Format Export** — SRT, VTT, ASS (styled), TXT, JSON
+- **Keyboard Shortcuts** — Space (play/pause), Ctrl+S (export SRT)
+- **Offline-capable** — Works entirely in-browser after initial load (except API call)
+
+## Tech Stack
+
+- **Framework**: Next.js 16 with App Router
+- **Language**: TypeScript (strict)
+- **Styling**: Tailwind CSS v4
+- **UI**: shadcn/ui + lucide-react
+- **Transcription**: Groq Whisper API (free tier)
+- **Audio Processing**: Web Audio API (browser-native)
+
+## Setup
+
+### 1. Clone and install
+
+```bash
+git clone <your-repo-url>
+cd captiongen
+npm install
+```
+
+### 2. Add your Groq API key
+
+```bash
+cp .env.example .env.local
+```
+
+Edit `.env.local` and add your key:
+
+```env
+GROQ_API_KEY=gsk_your_key_here
+```
+
+### 3. Run development server
 
 ```bash
 npm run dev
-# or
-yarn dev
-# or
-pnpm dev
-# or
-bun dev
 ```
 
-Open [http://localhost:3000](http://localhost:3000) with your browser to see the result.
+Open [http://localhost:3000](http://localhost:3000)
 
-You can start editing the page by modifying `app/page.tsx`. The page auto-updates as you edit the file.
+## Getting a Free Groq API Key
 
-This project uses [`next/font`](https://nextjs.org/docs/app/building-your-application/optimizing/fonts) to automatically optimize and load [Geist](https://vercel.com/font), a new font family for Vercel.
+1. Go to [console.groq.com](https://console.groq.com)
+2. Sign up for a free account
+3. Navigate to **API Keys** in the sidebar
+4. Click **Create API Key**
+5. Copy the key (starts with `gsk_`)
+6. Paste it into `.env.local` or the in-app Settings panel
 
-## Learn More
+The free tier includes generous limits for Whisper transcription.
 
-To learn more about Next.js, take a look at the following resources:
+## Deploy to Vercel
 
-- [Next.js Documentation](https://nextjs.org/docs) - learn about Next.js features and API.
-- [Learn Next.js](https://nextjs.org/learn) - an interactive Next.js tutorial.
+1. Push your code to GitHub
+2. Go to [vercel.com/new](https://vercel.com/new) and import your repo
+3. Add environment variable: `GROQ_API_KEY` = your key
+4. Click **Deploy**
 
-You can check out [the Next.js GitHub repository](https://github.com/vercel/next.js) - your feedback and contributions are welcome!
+## Usage
 
-## Deploy on Vercel
+1. Upload a video (MP4, WebM, MOV — up to 500MB)
+2. Click **Generate Captions** (add API key in Settings first)
+3. Choose a caption template from the Templates panel
+4. Edit captions in the Editor panel if needed
+5. Export your captions in the Export panel
 
-The easiest way to deploy your Next.js app is to use the [Vercel Platform](https://vercel.com/new?utm_medium=default-template&filter=next.js&utm_source=create-next-app&utm_campaign=create-next-app-readme) from the creators of Next.js.
+## Supported Languages
 
-Check out our [Next.js deployment documentation](https://nextjs.org/docs/app/building-your-application/deploying) for more details.
+| Code | Language |
+|------|----------|
+| auto | Auto Detect |
+| hi | Hindi / Hinglish |
+| en | English |
+| ur | Urdu |
+| te | Telugu |
+| ta | Tamil |
+| bn | Bengali |
+| mr | Marathi |
+| gu | Gujarati |
+| kn | Kannada |
+| ml | Malayalam |
+| pa | Punjabi |
+| ar | Arabic |
+
+## License
+
+MIT
