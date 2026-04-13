@@ -214,16 +214,28 @@ async function exportMP4(
   onProgress: (pct: number) => void,
   signal: AbortSignal
 ): Promise<Blob> {
-  // Verify a working codec config exists before doing any work
   const codec = await resolveVideoCodec(outW, outH, bitrate, fps);
   if (!codec) throw new Error("No supported H.264 codec found on this device.");
+
+  // ── Separate hidden video element so the visible player keeps playing ─────
+  const ev = document.createElement("video");
+  ev.src        = videoEl.src;
+  ev.muted      = true;
+  ev.playsInline = true;
+  ev.preload    = "auto";
+  await new Promise<void>((res, rej) => {
+    ev.onloadedmetadata = () => res();
+    ev.onerror = () => rej(new Error("Export video failed to load"));
+    setTimeout(() => rej(new Error("Video load timeout")), 15_000);
+  });
 
   const canvas = document.createElement("canvas");
   canvas.width  = outW;
   canvas.height = outH;
-  const ctx = canvas.getContext("2d", { willReadFrequently: true })!;
+  // No willReadFrequently — VideoFrame reads from GPU, no CPU readback needed
+  const ctx = canvas.getContext("2d")!;
 
-  // ── Decode audio upfront ──────────────────────────────────────────────────
+  // ── Decode audio ──────────────────────────────────────────────────────────
   let audioBuffer: AudioBuffer | null = null;
   try {
     const resp = await fetch(videoEl.src);
@@ -231,7 +243,7 @@ async function exportMP4(
     const actx = new AudioContext();
     audioBuffer = await actx.decodeAudioData(ab);
     await actx.close();
-  } catch { /* no audio — continue video-only */ }
+  } catch { /* no audio track — continue video-only */ }
 
   // ── Muxer ─────────────────────────────────────────────────────────────────
   const muxer = new Muxer({
@@ -247,16 +259,15 @@ async function exportMP4(
     fastStart: "in-memory",
   });
 
-  // ── Video encoder ─────────────────────────────────────────────────────────
-  // eslint-disable-next-line prefer-const
+  // ── Encoders ──────────────────────────────────────────────────────────────
   let encoderError: DOMException | null = null;
+
   const videoEncoder = new VideoEncoder({
     output: (chunk, meta) => muxer.addVideoChunk(chunk, meta!),
     error:  (e) => { encoderError = e; },
   });
   videoEncoder.configure({ codec, width: outW, height: outH, bitrate });
 
-  // ── Audio encoder + feed all audio ───────────────────────────────────────
   if (audioBuffer) {
     const audioEncoder = new AudioEncoder({
       output: (chunk, meta) => muxer.addAudioChunk(chunk, meta!),
@@ -269,10 +280,10 @@ async function exportMP4(
       bitrate: 192_000,
     });
 
-    const SR      = audioBuffer.sampleRate;
-    const CHUNK   = 4096;
-    const nch     = audioBuffer.numberOfChannels;
-    const chData  = Array.from({ length: nch }, (_, c) => audioBuffer!.getChannelData(c));
+    const SR     = audioBuffer.sampleRate;
+    const CHUNK  = 4096;
+    const nch    = audioBuffer.numberOfChannels;
+    const chData = Array.from({ length: nch }, (_, c) => audioBuffer!.getChannelData(c));
 
     for (let i = 0; i < audioBuffer.length; i += CHUNK) {
       const count = Math.min(CHUNK, audioBuffer.length - i);
@@ -292,28 +303,30 @@ async function exportMP4(
     await audioEncoder.flush();
   }
 
-  // ── Frame loop via requestVideoFrameCallback ──────────────────────────────
-  // Fires exactly once per decoded video frame — preserves source fps accurately.
-  const duration = videoEl.duration || 1;
+  // ── Frame loop on hidden element ──────────────────────────────────────────
+  const duration = ev.duration || videoEl.duration || 1;
   let frameIdx   = 0;
 
+  type VFRC = (now: DOMHighResTimeStamp, metadata: { mediaTime: number }) => void;
+  const rvfc = (el: HTMLVideoElement, cb: VFRC) =>
+    (el as unknown as { requestVideoFrameCallback: (cb: VFRC) => void }).requestVideoFrameCallback(cb);
+
   await new Promise<void>((resolve, reject) => {
-    type VFRC = (now: DOMHighResTimeStamp, metadata: { mediaTime: number }) => void;
-    const rvfc = (videoEl as unknown as { requestVideoFrameCallback: (cb: VFRC) => void }).requestVideoFrameCallback.bind(videoEl);
+    let done = false;
+    const finish = () => { if (!done) { done = true; ev.pause(); resolve(); } };
 
     const onFrame: VFRC = (_now, metadata) => {
-      if (signal.aborted) { reject(new DOMException("Aborted", "AbortError")); return; }
-      if (encoderError)   { reject(encoderError); return; }
+      if (done) return;
+      if (signal.aborted) { done = true; ev.pause(); reject(new DOMException("Aborted", "AbortError")); return; }
+      if (encoderError)   { done = true; ev.pause(); reject(encoderError); return; }
 
       const t = metadata.mediaTime;
-
-      // Draw video frame + captions onto canvas
-      ctx.drawImage(videoEl, 0, 0, outW, outH);
+      ctx.drawImage(ev, 0, 0, outW, outH);
       const cap = captions.find(c => t >= c.start && t <= c.end) ?? null;
       if (cap) drawCaptionFrame(ctx, outW, outH, cap, template, t, captionScale, captionPosition);
 
-      // Skip encode if queue is backed up — prevents encoder overload
-      if (videoEncoder.encodeQueueSize < 30) {
+      // Queue limit of 8 — prevents memory crash on 4K
+      if (videoEncoder.encodeQueueSize < 8) {
         const frame = new VideoFrame(canvas, { timestamp: Math.round(t * 1_000_000) });
         videoEncoder.encode(frame, { keyFrame: frameIdx % (fps * 2) === 0 });
         frame.close();
@@ -322,24 +335,23 @@ async function exportMP4(
 
       onProgress(Math.min(98, (t / duration) * 100));
 
-      if (videoEl.ended || t >= duration - 0.05) resolve();
-      else rvfc(onFrame);
+      if (ev.ended || t >= duration - 0.05) finish();
+      else rvfc(ev, onFrame);
     };
 
-    videoEl.currentTime = 0;
-    videoEl.playbackRate = 1;
-    videoEl.play()
-      .then(() => rvfc(onFrame))
+    ev.onended = finish;
+    ev.currentTime = 0;
+    ev.play()
+      .then(() => rvfc(ev, onFrame))
       .catch(reject);
-
-    videoEl.onended = () => resolve();
   });
+
+  ev.src = ""; // release memory
 
   await videoEncoder.flush();
   if (encoderError) throw new Error(`Encoder error: ${String(encoderError)}`);
 
   muxer.finalize();
-
   const { buffer } = muxer.target as ArrayBufferTarget;
   return new Blob([buffer], { type: "video/mp4" });
 }
