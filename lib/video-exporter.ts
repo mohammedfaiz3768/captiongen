@@ -292,43 +292,48 @@ async function exportMP4(
     await audioEncoder.flush();
   }
 
-  // ── Seek-based frame loop ─────────────────────────────────────────────────
-  const duration      = videoEl.duration || 1;
-  const frameInterval = 1 / fps;
-  let   frameIdx      = 0;
+  // ── Frame loop via requestVideoFrameCallback ──────────────────────────────
+  // Fires exactly once per decoded video frame — preserves source fps accurately.
+  const duration = videoEl.duration || 1;
+  let frameIdx   = 0;
 
-  const seekTo = (t: number) =>
-    new Promise<void>((res) => {
-      videoEl.currentTime = t;
-      videoEl.addEventListener("seeked", () => res(), { once: true });
-    });
+  await new Promise<void>((resolve, reject) => {
+    type VFRC = (now: DOMHighResTimeStamp, metadata: { mediaTime: number }) => void;
+    const rvfc = (videoEl as unknown as { requestVideoFrameCallback: (cb: VFRC) => void }).requestVideoFrameCallback.bind(videoEl);
 
-  await seekTo(0);
+    const onFrame: VFRC = (_now, metadata) => {
+      if (signal.aborted) { reject(new DOMException("Aborted", "AbortError")); return; }
+      if (encoderError)   { reject(encoderError); return; }
 
-  for (let t = 0; t <= duration + frameInterval / 2; t += frameInterval) {
-    if (signal.aborted) throw new DOMException("Aborted", "AbortError");
-    if (encoderError)   throw new Error(`Encoder error: ${(encoderError as DOMException).message}`);
+      const t = metadata.mediaTime;
 
-    // Throttle: don't let the queue grow beyond 20 frames
-    while (videoEncoder.encodeQueueSize > 20) {
-      await new Promise(r => setTimeout(r, 10));
-    }
+      // Draw video frame + captions onto canvas
+      ctx.drawImage(videoEl, 0, 0, outW, outH);
+      const cap = captions.find(c => t >= c.start && t <= c.end) ?? null;
+      if (cap) drawCaptionFrame(ctx, outW, outH, cap, template, t, captionScale, captionPosition);
 
-    await seekTo(Math.min(t, duration));
+      // Skip encode if queue is backed up — prevents encoder overload
+      if (videoEncoder.encodeQueueSize < 30) {
+        const frame = new VideoFrame(canvas, { timestamp: Math.round(t * 1_000_000) });
+        videoEncoder.encode(frame, { keyFrame: frameIdx % (fps * 2) === 0 });
+        frame.close();
+        frameIdx++;
+      }
 
-    ctx.drawImage(videoEl, 0, 0, outW, outH);
-    const cap = captions.find(c => t >= c.start && t <= c.end) ?? null;
-    if (cap) drawCaptionFrame(ctx, outW, outH, cap, template, t, captionScale, captionPosition);
+      onProgress(Math.min(98, (t / duration) * 100));
 
-    const ts_us  = Math.round(t * 1_000_000);
-    const dur_us = Math.round(frameInterval * 1_000_000);
-    const frame  = new VideoFrame(canvas, { timestamp: ts_us, duration: dur_us });
-    videoEncoder.encode(frame, { keyFrame: frameIdx % (fps * 2) === 0 });
-    frame.close();
-    frameIdx++;
+      if (videoEl.ended || t >= duration - 0.05) resolve();
+      else rvfc(onFrame);
+    };
 
-    onProgress(Math.min(98, (t / duration) * 100));
-  }
+    videoEl.currentTime = 0;
+    videoEl.playbackRate = 1;
+    videoEl.play()
+      .then(() => rvfc(onFrame))
+      .catch(reject);
+
+    videoEl.onended = () => resolve();
+  });
 
   await videoEncoder.flush();
   if (encoderError) throw new Error(`Encoder error: ${String(encoderError)}`);
