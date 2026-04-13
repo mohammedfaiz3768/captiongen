@@ -5,9 +5,9 @@ export type ExportResolution = "1080p" | "1440p" | "4k";
 export type ExportFPS = 30 | 60;
 
 export const EXPORT_RESOLUTIONS: Record<ExportResolution, { maxLongSide: number; bitrate: number; label: string }> = {
-  "1080p": { maxLongSide: 1920,  bitrate: 12_000_000, label: "1080p Full HD" },
-  "1440p": { maxLongSide: 2560,  bitrate: 24_000_000, label: "1440p 2K" },
-  "4k":    { maxLongSide: 3840,  bitrate: 80_000_000, label: "4K Ultra HD" },
+  "1080p": { maxLongSide: 1920, bitrate:  8_000_000, label: "1080p Full HD" },
+  "1440p": { maxLongSide: 2560, bitrate: 16_000_000, label: "1440p 2K" },
+  "4k":    { maxLongSide: 3840, bitrate: 20_000_000, label: "4K Ultra HD" },
 };
 
 /** Compute canvas dimensions preserving the video's actual aspect ratio. */
@@ -333,44 +333,50 @@ async function exportMP4(
     captured = null; // free memory before video encoding
   }
 
-  // ── Phase 2: Seek-based frame loop (sequential = safe, no memory spike) ───
-  const frameInterval = 1 / fps;
+  // ── Phase 2: requestVideoFrameCallback — real decoded frames, realtime ─────
+  // Guarantees a properly decoded frame on every callback. No seek artifacts.
+  // Total time = video duration (realtime playback).
   let frameIdx = 0;
 
-  const seekTo = (t: number) => new Promise<void>((res) => {
-    ev.currentTime = t;
-    ev.addEventListener("seeked", () => res(), { once: true });
+  type VFRC = (now: DOMHighResTimeStamp, metadata: { mediaTime: number }) => void;
+  const rvfc = (el: HTMLVideoElement, cb: VFRC) =>
+    (el as unknown as { requestVideoFrameCallback: (cb: VFRC) => void }).requestVideoFrameCallback(cb);
+
+  await new Promise<void>((resolve, reject) => {
+    let done = false;
+    const finish = () => { if (!done) { done = true; ev.pause(); resolve(); } };
+
+    const onFrame: VFRC = (_now, metadata) => {
+      if (done) return;
+      if (signal.aborted) { done = true; ev.pause(); reject(new DOMException("Aborted", "AbortError")); return; }
+      if (encoderError)   { done = true; ev.pause(); reject(encoderError); return; }
+
+      const t = metadata.mediaTime;
+
+      ctx.drawImage(ev, 0, 0, outW, outH);
+      const cap = captions.find(c => t >= c.start && t <= c.end) ?? null;
+      if (cap) drawCaptionFrame(ctx, outW, outH, cap, template, t, captionScale, captionPosition);
+
+      // Only encode if queue isn't backed up — keeps memory stable
+      if (videoEncoder.encodeQueueSize < 4) {
+        const frame = new VideoFrame(canvas, { timestamp: Math.round(t * 1_000_000) });
+        videoEncoder.encode(frame, { keyFrame: frameIdx % (fps * 2) === 0 });
+        frame.close();
+        frameIdx++;
+      }
+
+      onProgress(20 + Math.min(78, (t / duration) * 78));
+
+      if (ev.ended || t >= duration - 0.05) finish();
+      else rvfc(ev, onFrame);
+    };
+
+    ev.onended = finish;
+    ev.currentTime = 0;
+    ev.play()
+      .then(() => rvfc(ev, onFrame))
+      .catch(reject);
   });
-
-  for (let t = 0; t <= duration + frameInterval / 2; t += frameInterval) {
-    if (signal.aborted) throw new DOMException("Aborted", "AbortError");
-    if (encoderError)   throw encoderError;
-
-    // Wait if encoder queue is backed up
-    while (videoEncoder.encodeQueueSize > 4) {
-      await new Promise(r => setTimeout(r, 5));
-    }
-
-    await seekTo(Math.min(t, duration));
-
-    ctx.drawImage(ev, 0, 0, outW, outH);
-    const cap = captions.find(c => t >= c.start && t <= c.end) ?? null;
-    if (cap) drawCaptionFrame(ctx, outW, outH, cap, template, t, captionScale, captionPosition);
-
-    const frame = new VideoFrame(canvas, {
-      timestamp: Math.round(t * 1_000_000),
-      duration:  Math.round(frameInterval * 1_000_000),
-    });
-    videoEncoder.encode(frame, { keyFrame: frameIdx % (fps * 2) === 0 });
-    frame.close();
-    frameIdx++;
-
-    // 20–98% for video encoding phase
-    onProgress(20 + Math.min(78, ((t / duration) * 78)));
-
-    // Yield every 8 frames so the browser doesn't freeze
-    if (frameIdx % 8 === 0) await new Promise(r => setTimeout(r, 0));
-  }
 
   ev.src = "";
   await videoEncoder.flush();
