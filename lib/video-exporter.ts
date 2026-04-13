@@ -217,7 +217,65 @@ async function exportMP4(
   const codec = await resolveVideoCodec(outW, outH, bitrate, fps);
   if (!codec) throw new Error("No supported H.264 codec found on this device.");
 
-  // ── Separate hidden video element so the visible player keeps playing ─────
+  const duration = videoEl.duration || 1;
+
+  // ── Phase 1: Capture audio via Web Audio (no full-file ArrayBuffer copy) ──
+  // ScriptProcessorNode reads audio from the playing video in real-time.
+  // This avoids fetch()+decodeAudioData() which doubles RAM usage for large files.
+  type AudioCapture = { leftChunks: Float32Array[]; rightChunks: Float32Array[] };
+  let captured: AudioCapture | null = null;
+
+  try {
+    const audioEl = document.createElement("video");
+    audioEl.src       = videoEl.src;
+    audioEl.muted     = false;
+    audioEl.playsInline = true;
+    audioEl.preload   = "auto";
+
+    await new Promise<void>((res, rej) => {
+      audioEl.oncanplay = () => res();
+      audioEl.onerror   = () => rej();
+      setTimeout(rej, 15_000);
+    });
+
+    const actx     = new AudioContext({ sampleRate: 44100 });
+    const source   = actx.createMediaElementSource(audioEl);
+    // eslint-disable-next-line @typescript-eslint/no-deprecated
+    const processor = actx.createScriptProcessor(8192, 2, 2);
+    const silencer  = actx.createGain();
+    silencer.gain.value = 0; // capture without playing through speakers
+
+    source.connect(processor);
+    processor.connect(silencer);
+    silencer.connect(actx.destination);
+
+    const leftChunks: Float32Array[]  = [];
+    const rightChunks: Float32Array[] = [];
+
+    processor.onaudioprocess = (e) => {
+      leftChunks.push(new Float32Array(e.inputBuffer.getChannelData(0)));
+      rightChunks.push(new Float32Array(
+        e.inputBuffer.numberOfChannels > 1 ? e.inputBuffer.getChannelData(1) : e.inputBuffer.getChannelData(0)
+      ));
+    };
+
+    audioEl.currentTime = 0;
+    await audioEl.play();
+    onProgress(2); // show activity
+
+    await new Promise<void>((res) => { audioEl.onended = () => res(); });
+
+    processor.disconnect(); source.disconnect();
+    await actx.close();
+    audioEl.src = "";
+
+    if (leftChunks.length > 0) captured = { leftChunks, rightChunks };
+  } catch { /* no audio or autoplay blocked — export video-only */ }
+
+  if (signal.aborted) throw new DOMException("Aborted", "AbortError");
+  onProgress(20);
+
+  // ── Set up canvas + hidden video for frame capture ────────────────────────
   const ev = document.createElement("video");
   ev.src        = videoEl.src;
   ev.muted      = true;
@@ -225,42 +283,25 @@ async function exportMP4(
   ev.preload    = "auto";
   await new Promise<void>((res, rej) => {
     ev.onloadedmetadata = () => res();
-    ev.onerror = () => rej(new Error("Export video failed to load"));
+    ev.onerror          = () => rej(new Error("Export video failed to load"));
     setTimeout(() => rej(new Error("Video load timeout")), 15_000);
   });
 
   const canvas = document.createElement("canvas");
   canvas.width  = outW;
   canvas.height = outH;
-  // No willReadFrequently — VideoFrame reads from GPU, no CPU readback needed
   const ctx = canvas.getContext("2d")!;
-
-  // ── Decode audio ──────────────────────────────────────────────────────────
-  let audioBuffer: AudioBuffer | null = null;
-  try {
-    const resp = await fetch(videoEl.src);
-    const ab   = await resp.arrayBuffer();
-    const actx = new AudioContext();
-    audioBuffer = await actx.decodeAudioData(ab);
-    await actx.close();
-  } catch { /* no audio track — continue video-only */ }
 
   // ── Muxer ─────────────────────────────────────────────────────────────────
   const muxer = new Muxer({
     target: new ArrayBufferTarget(),
     video: { codec: "avc", width: outW, height: outH },
-    ...(audioBuffer ? {
-      audio: {
-        codec: "aac",
-        sampleRate: audioBuffer.sampleRate,
-        numberOfChannels: audioBuffer.numberOfChannels,
-      }
-    } : {}),
+    ...(captured ? { audio: { codec: "aac", sampleRate: 44100, numberOfChannels: 2 } } : {}),
     fastStart: "in-memory",
   });
 
   // ── Encoders ──────────────────────────────────────────────────────────────
-  let encoderError: DOMException | null = null;
+  let encoderError: Error | null = null;
 
   const videoEncoder = new VideoEncoder({
     output: (chunk, meta) => muxer.addVideoChunk(chunk, meta!),
@@ -268,88 +309,72 @@ async function exportMP4(
   });
   videoEncoder.configure({ codec, width: outW, height: outH, bitrate });
 
-  if (audioBuffer) {
+  // Encode captured audio first
+  if (captured) {
     const audioEncoder = new AudioEncoder({
       output: (chunk, meta) => muxer.addAudioChunk(chunk, meta!),
       error:  (e) => { encoderError = e; },
     });
-    audioEncoder.configure({
-      codec: "mp4a.40.2",
-      sampleRate: audioBuffer.sampleRate,
-      numberOfChannels: audioBuffer.numberOfChannels,
-      bitrate: 192_000,
-    });
+    audioEncoder.configure({ codec: "mp4a.40.2", sampleRate: 44100, numberOfChannels: 2, bitrate: 192_000 });
 
-    const SR     = audioBuffer.sampleRate;
-    const CHUNK  = 4096;
-    const nch    = audioBuffer.numberOfChannels;
-    const chData = Array.from({ length: nch }, (_, c) => audioBuffer!.getChannelData(c));
-
-    for (let i = 0; i < audioBuffer.length; i += CHUNK) {
-      const count = Math.min(CHUNK, audioBuffer.length - i);
-      const plane = new Float32Array(count * nch);
-      for (let c = 0; c < nch; c++) plane.set(chData[c].subarray(i, i + count), c * count);
-      const ad = new AudioData({
-        format: "f32-planar",
-        sampleRate: SR,
-        numberOfFrames: count,
-        numberOfChannels: nch,
-        timestamp: Math.round((i / SR) * 1_000_000),
-        data: plane,
-      });
+    let audioTs = 0;
+    for (let i = 0; i < captured.leftChunks.length; i++) {
+      const l  = captured.leftChunks[i];
+      const r  = captured.rightChunks[i];
+      const nf = l.length;
+      const plane = new Float32Array(nf * 2);
+      plane.set(l, 0); plane.set(r, nf);
+      const ad = new AudioData({ format: "f32-planar", sampleRate: 44100, numberOfFrames: nf, numberOfChannels: 2, timestamp: audioTs, data: plane });
       audioEncoder.encode(ad);
       ad.close();
+      audioTs += Math.round((nf / 44100) * 1_000_000);
     }
     await audioEncoder.flush();
+    captured = null; // free memory before video encoding
   }
 
-  // ── Frame loop on hidden element ──────────────────────────────────────────
-  const duration = ev.duration || videoEl.duration || 1;
-  let frameIdx   = 0;
+  // ── Phase 2: Seek-based frame loop (sequential = safe, no memory spike) ───
+  const frameInterval = 1 / fps;
+  let frameIdx = 0;
 
-  type VFRC = (now: DOMHighResTimeStamp, metadata: { mediaTime: number }) => void;
-  const rvfc = (el: HTMLVideoElement, cb: VFRC) =>
-    (el as unknown as { requestVideoFrameCallback: (cb: VFRC) => void }).requestVideoFrameCallback(cb);
-
-  await new Promise<void>((resolve, reject) => {
-    let done = false;
-    const finish = () => { if (!done) { done = true; ev.pause(); resolve(); } };
-
-    const onFrame: VFRC = (_now, metadata) => {
-      if (done) return;
-      if (signal.aborted) { done = true; ev.pause(); reject(new DOMException("Aborted", "AbortError")); return; }
-      if (encoderError)   { done = true; ev.pause(); reject(encoderError); return; }
-
-      const t = metadata.mediaTime;
-      ctx.drawImage(ev, 0, 0, outW, outH);
-      const cap = captions.find(c => t >= c.start && t <= c.end) ?? null;
-      if (cap) drawCaptionFrame(ctx, outW, outH, cap, template, t, captionScale, captionPosition);
-
-      // Queue limit of 8 — prevents memory crash on 4K
-      if (videoEncoder.encodeQueueSize < 8) {
-        const frame = new VideoFrame(canvas, { timestamp: Math.round(t * 1_000_000) });
-        videoEncoder.encode(frame, { keyFrame: frameIdx % (fps * 2) === 0 });
-        frame.close();
-        frameIdx++;
-      }
-
-      onProgress(Math.min(98, (t / duration) * 100));
-
-      if (ev.ended || t >= duration - 0.05) finish();
-      else rvfc(ev, onFrame);
-    };
-
-    ev.onended = finish;
-    ev.currentTime = 0;
-    ev.play()
-      .then(() => rvfc(ev, onFrame))
-      .catch(reject);
+  const seekTo = (t: number) => new Promise<void>((res) => {
+    ev.currentTime = t;
+    ev.addEventListener("seeked", () => res(), { once: true });
   });
 
-  ev.src = ""; // release memory
+  for (let t = 0; t <= duration + frameInterval / 2; t += frameInterval) {
+    if (signal.aborted) throw new DOMException("Aborted", "AbortError");
+    if (encoderError)   throw encoderError;
 
+    // Wait if encoder queue is backed up
+    while (videoEncoder.encodeQueueSize > 4) {
+      await new Promise(r => setTimeout(r, 5));
+    }
+
+    await seekTo(Math.min(t, duration));
+
+    ctx.drawImage(ev, 0, 0, outW, outH);
+    const cap = captions.find(c => t >= c.start && t <= c.end) ?? null;
+    if (cap) drawCaptionFrame(ctx, outW, outH, cap, template, t, captionScale, captionPosition);
+
+    const frame = new VideoFrame(canvas, {
+      timestamp: Math.round(t * 1_000_000),
+      duration:  Math.round(frameInterval * 1_000_000),
+    });
+    videoEncoder.encode(frame, { keyFrame: frameIdx % (fps * 2) === 0 });
+    frame.close();
+    frameIdx++;
+
+    // 20–98% for video encoding phase
+    onProgress(20 + Math.min(78, ((t / duration) * 78)));
+
+    // Yield every 8 frames so the browser doesn't freeze
+    if (frameIdx % 8 === 0) await new Promise(r => setTimeout(r, 0));
+  }
+
+  ev.src = "";
   await videoEncoder.flush();
-  if (encoderError) throw new Error(`Encoder error: ${String(encoderError)}`);
+  if (encoderError) throw encoderError;
 
   muxer.finalize();
   const { buffer } = muxer.target as ArrayBufferTarget;
