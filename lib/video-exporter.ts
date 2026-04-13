@@ -287,10 +287,10 @@ async function exportMP4(
     setTimeout(() => rej(new Error("Video load timeout")), 15_000);
   });
 
-  const canvas = document.createElement("canvas");
-  canvas.width  = outW;
-  canvas.height = outH;
-  const ctx = canvas.getContext("2d")!;
+  // OffscreenCanvas: GPU-to-GPU path — no CPU readback when creating VideoFrame.
+  // A regular DOM canvas forces GPU→CPU→GPU (~33 MB at 4K per frame = 3 s/frame).
+  const canvas = new OffscreenCanvas(outW, outH);
+  const ctx    = canvas.getContext("2d")!;
 
   // ── Muxer ─────────────────────────────────────────────────────────────────
   const muxer = new Muxer({
@@ -355,15 +355,13 @@ async function exportMP4(
 
       ctx.drawImage(ev, 0, 0, outW, outH);
       const cap = captions.find(c => t >= c.start && t <= c.end) ?? null;
-      if (cap) drawCaptionFrame(ctx, outW, outH, cap, template, t, captionScale, captionPosition);
+      if (cap) drawCaptionFrame(ctx as unknown as CanvasRenderingContext2D, outW, outH, cap, template, t, captionScale, captionPosition);
 
-      // Only encode if queue isn't backed up — keeps memory stable
-      if (videoEncoder.encodeQueueSize < 4) {
-        const frame = new VideoFrame(canvas, { timestamp: Math.round(t * 1_000_000) });
-        videoEncoder.encode(frame, { keyFrame: frameIdx % (fps * 2) === 0 });
-        frame.close();
-        frameIdx++;
-      }
+      // Encode every frame — frame.close() releases memory immediately after encode()
+      const frame = new VideoFrame(canvas, { timestamp: Math.round(t * 1_000_000) });
+      videoEncoder.encode(frame, { keyFrame: frameIdx % 60 === 0 });
+      frame.close();
+      frameIdx++;
 
       onProgress(20 + Math.min(78, (t / duration) * 78));
 
@@ -372,7 +370,8 @@ async function exportMP4(
     };
 
     ev.onended = finish;
-    ev.currentTime = 0;
+    ev.currentTime  = 0;
+    ev.playbackRate = 0.5; // 2× time budget per frame; mediaTime timestamps stay correct
     ev.play()
       .then(() => rvfc(ev, onFrame))
       .catch(reject);
