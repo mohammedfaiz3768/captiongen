@@ -125,7 +125,8 @@ export default function ExportPanel({
         resolution,
         fps,
         (pct) => setExportProgress(pct),
-        abortRef.current.signal
+        abortRef.current.signal,
+        (warning) => toast.warning(warning)
       );
 
       const url = URL.createObjectURL(blob);

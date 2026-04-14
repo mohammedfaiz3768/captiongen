@@ -10,14 +10,22 @@ export const EXPORT_RESOLUTIONS: Record<ExportResolution, { maxLongSide: number;
   "4k":    { maxLongSide: 3840, bitrate: 20_000_000, label: "4K Ultra HD" },
 };
 
-/** Compute canvas dimensions preserving the video's actual aspect ratio. */
+/**
+ * Compute canvas dimensions preserving the video's actual aspect ratio.
+ * Also caps to the video's native resolution — no pointless upscaling.
+ */
 function computeDimensions(videoEl: HTMLVideoElement, maxLongSide: number) {
   const vw = videoEl.videoWidth  || 1920;
   const vh = videoEl.videoHeight || 1080;
   const aspect = vw / vh;
+
+  // Cap maxLongSide to native resolution (upscaling 1080p to 4K is pure waste)
+  const nativeLong = Math.max(vw, vh);
+  const effectiveMax = Math.min(maxLongSide, nativeLong);
+
   let w: number, h: number;
-  if (aspect >= 1) { w = maxLongSide; h = Math.round(maxLongSide / aspect); }
-  else             { h = maxLongSide; w = Math.round(maxLongSide * aspect); }
+  if (aspect >= 1) { w = effectiveMax; h = Math.round(effectiveMax / aspect); }
+  else             { h = effectiveMax; w = Math.round(effectiveMax * aspect); }
   // H.264 requires even dimensions
   return { w: w % 2 === 0 ? w : w - 1, h: h % 2 === 0 ? h : h - 1 };
 }
@@ -201,6 +209,20 @@ async function resolveVideoCodec(outW: number, outH: number, bitrate: number, fp
   return null; // no H.264 support
 }
 
+/** Create a canvas — OffscreenCanvas if available (GPU path), DOM canvas as fallback. */
+function makeCanvas(w: number, h: number): { canvas: OffscreenCanvas | HTMLCanvasElement; ctx: CanvasRenderingContext2D } {
+  if (typeof OffscreenCanvas !== "undefined") {
+    const canvas = new OffscreenCanvas(w, h);
+    const ctx = canvas.getContext("2d")!;
+    return { canvas, ctx: ctx as unknown as CanvasRenderingContext2D };
+  }
+  const canvas = document.createElement("canvas");
+  canvas.width  = w;
+  canvas.height = h;
+  const ctx = canvas.getContext("2d")!;
+  return { canvas, ctx };
+}
+
 async function exportMP4(
   videoEl: HTMLVideoElement,
   captions: Caption[],
@@ -214,93 +236,58 @@ async function exportMP4(
   onProgress: (pct: number) => void,
   signal: AbortSignal
 ): Promise<Blob> {
+  // Check for requestVideoFrameCallback support upfront
+  if (!("requestVideoFrameCallback" in HTMLVideoElement.prototype)) {
+    throw new Error("requestVideoFrameCallback not supported");
+  }
+
   const codec = await resolveVideoCodec(outW, outH, bitrate, fps);
   if (!codec) throw new Error("No supported H.264 codec found on this device.");
 
   const duration = videoEl.duration || 1;
-
-  // ── Phase 1: Capture audio via Web Audio (no full-file ArrayBuffer copy) ──
-  // ScriptProcessorNode reads audio from the playing video in real-time.
-  // This avoids fetch()+decodeAudioData() which doubles RAM usage for large files.
-  type AudioCapture = { leftChunks: Float32Array[]; rightChunks: Float32Array[] };
-  let captured: AudioCapture | null = null;
-
-  try {
-    const audioEl = document.createElement("video");
-    audioEl.src       = videoEl.src;
-    audioEl.muted     = false;
-    audioEl.playsInline = true;
-    audioEl.preload   = "auto";
-
-    await new Promise<void>((res, rej) => {
-      audioEl.oncanplay = () => res();
-      audioEl.onerror   = () => rej();
-      setTimeout(rej, 15_000);
-    });
-
-    const actx     = new AudioContext({ sampleRate: 44100 });
-    const source   = actx.createMediaElementSource(audioEl);
-    // eslint-disable-next-line @typescript-eslint/no-deprecated
-    const processor = actx.createScriptProcessor(8192, 2, 2);
-    const silencer  = actx.createGain();
-    silencer.gain.value = 0; // capture without playing through speakers
-
-    source.connect(processor);
-    processor.connect(silencer);
-    silencer.connect(actx.destination);
-
-    const leftChunks: Float32Array[]  = [];
-    const rightChunks: Float32Array[] = [];
-
-    processor.onaudioprocess = (e) => {
-      leftChunks.push(new Float32Array(e.inputBuffer.getChannelData(0)));
-      rightChunks.push(new Float32Array(
-        e.inputBuffer.numberOfChannels > 1 ? e.inputBuffer.getChannelData(1) : e.inputBuffer.getChannelData(0)
-      ));
-    };
-
-    audioEl.currentTime = 0;
-    await audioEl.play();
-    onProgress(2); // show activity
-
-    await new Promise<void>((res) => { audioEl.onended = () => res(); });
-
-    processor.disconnect(); source.disconnect();
-    await actx.close();
-    audioEl.src = "";
-
-    if (leftChunks.length > 0) captured = { leftChunks, rightChunks };
-  } catch { /* no audio or autoplay blocked — export video-only */ }
+  onProgress(5);
 
   if (signal.aborted) throw new DOMException("Aborted", "AbortError");
-  onProgress(20);
 
-  // ── Set up canvas + hidden video for frame capture ────────────────────────
+  // ── Hidden video element for frame capture ────────────────────────────────
+  // Placed inside a 0×0 overflow:hidden container at top:0,left:0 so the browser
+  // treats it as "visible" (no background throttling) without rendering anything.
+  const wrapper = document.createElement("div");
+  wrapper.style.cssText = "position:fixed;top:0;left:0;width:0;height:0;overflow:hidden;pointer-events:none;z-index:-1";
+  document.body.appendChild(wrapper);
+
   const ev = document.createElement("video");
-  ev.src        = videoEl.src;
-  ev.muted      = true;
-  ev.playsInline = true;
-  ev.preload    = "auto";
-  await new Promise<void>((res, rej) => {
-    ev.onloadedmetadata = () => res();
-    ev.onerror          = () => rej(new Error("Export video failed to load"));
-    setTimeout(() => rej(new Error("Video load timeout")), 15_000);
-  });
+  ev.src          = videoEl.src;
+  ev.muted        = true;
+  ev.playsInline  = true;
+  ev.preload      = "auto";
+  wrapper.appendChild(ev);
 
-  // OffscreenCanvas: GPU-to-GPU path — no CPU readback when creating VideoFrame.
-  // A regular DOM canvas forces GPU→CPU→GPU (~33 MB at 4K per frame = 3 s/frame).
-  const canvas = new OffscreenCanvas(outW, outH);
-  const ctx    = canvas.getContext("2d")!;
+  try {
+    await new Promise<void>((res, rej) => {
+      ev.onloadedmetadata = () => res();
+      ev.onerror          = () => rej(new Error("Export video failed to load"));
+      setTimeout(() => rej(new Error("Video load timeout")), 15_000);
+    });
+  } catch (err) {
+    document.body.removeChild(wrapper);
+    throw err;
+  }
+
+  onProgress(10);
+
+  // Use OffscreenCanvas if available (GPU-to-GPU, no CPU readback).
+  // DOM canvas forces GPU→CPU→GPU — expensive at 4K.
+  const { canvas, ctx } = makeCanvas(outW, outH);
 
   // ── Muxer ─────────────────────────────────────────────────────────────────
   const muxer = new Muxer({
     target: new ArrayBufferTarget(),
     video: { codec: "avc", width: outW, height: outH },
-    ...(captured ? { audio: { codec: "aac", sampleRate: 44100, numberOfChannels: 2 } } : {}),
     fastStart: "in-memory",
   });
 
-  // ── Encoders ──────────────────────────────────────────────────────────────
+  // ── Video encoder ──────────────────────────────────────────────────────────
   let encoderError: Error | null = null;
 
   const videoEncoder = new VideoEncoder({
@@ -309,75 +296,74 @@ async function exportMP4(
   });
   videoEncoder.configure({ codec, width: outW, height: outH, bitrate });
 
-  // Encode captured audio first
-  if (captured) {
-    const audioEncoder = new AudioEncoder({
-      output: (chunk, meta) => muxer.addAudioChunk(chunk, meta!),
-      error:  (e) => { encoderError = e; },
-    });
-    audioEncoder.configure({ codec: "mp4a.40.2", sampleRate: 44100, numberOfChannels: 2, bitrate: 192_000 });
-
-    let audioTs = 0;
-    for (let i = 0; i < captured.leftChunks.length; i++) {
-      const l  = captured.leftChunks[i];
-      const r  = captured.rightChunks[i];
-      const nf = l.length;
-      const plane = new Float32Array(nf * 2);
-      plane.set(l, 0); plane.set(r, nf);
-      const ad = new AudioData({ format: "f32-planar", sampleRate: 44100, numberOfFrames: nf, numberOfChannels: 2, timestamp: audioTs, data: plane });
-      audioEncoder.encode(ad);
-      ad.close();
-      audioTs += Math.round((nf / 44100) * 1_000_000);
-    }
-    await audioEncoder.flush();
-    captured = null; // free memory before video encoding
-  }
-
-  // ── Phase 2: requestVideoFrameCallback — real decoded frames, realtime ─────
-  // Guarantees a properly decoded frame on every callback. No seek artifacts.
-  // Total time = video duration (realtime playback).
+  // ── Frame loop via requestVideoFrameCallback ───────────────────────────────
+  // Fires once per decoded frame. When encoder queue backs up we pause the video,
+  // drain it, then resume — preventing the "stuck at N%" stall.
   let frameIdx = 0;
 
   type VFRC = (now: DOMHighResTimeStamp, metadata: { mediaTime: number }) => void;
   const rvfc = (el: HTMLVideoElement, cb: VFRC) =>
     (el as unknown as { requestVideoFrameCallback: (cb: VFRC) => void }).requestVideoFrameCallback(cb);
 
-  await new Promise<void>((resolve, reject) => {
-    let done = false;
-    const finish = () => { if (!done) { done = true; ev.pause(); resolve(); } };
+  try {
+    await new Promise<void>((resolve, reject) => {
+      let done = false;
+      const finish = () => { if (!done) { done = true; ev.pause(); resolve(); } };
+      const fail   = (e: unknown) => { if (!done) { done = true; ev.pause(); reject(e); } };
 
-    const onFrame: VFRC = (_now, metadata) => {
-      if (done) return;
-      if (signal.aborted) { done = true; ev.pause(); reject(new DOMException("Aborted", "AbortError")); return; }
-      if (encoderError)   { done = true; ev.pause(); reject(encoderError); return; }
+      const scheduleNext = () => {
+        if (done) return;
+        // Backpressure: if encoder queue is full, pause video and poll until it drains.
+        // This is why export appears to "pause" — we do it intentionally to avoid data loss.
+        if (videoEncoder.encodeQueueSize > 3) {
+          ev.pause();
+          const drain = () => {
+            if (done) return;
+            if (videoEncoder.encodeQueueSize <= 1) {
+              ev.play().then(() => rvfc(ev, onFrame)).catch(fail);
+            } else {
+              setTimeout(drain, 20);
+            }
+          };
+          setTimeout(drain, 20);
+        } else {
+          rvfc(ev, onFrame);
+        }
+      };
 
-      const t = metadata.mediaTime;
+      const onFrame: VFRC = (_now, metadata) => {
+        if (done) return;
+        if (signal.aborted) { fail(new DOMException("Aborted", "AbortError")); return; }
+        if (encoderError)   { fail(encoderError); return; }
 
-      ctx.drawImage(ev, 0, 0, outW, outH);
-      const cap = captions.find(c => t >= c.start && t <= c.end) ?? null;
-      if (cap) drawCaptionFrame(ctx as unknown as CanvasRenderingContext2D, outW, outH, cap, template, t, captionScale, captionPosition);
+        const t = metadata.mediaTime;
 
-      // Encode every frame — frame.close() releases memory immediately after encode()
-      const frame = new VideoFrame(canvas, { timestamp: Math.round(t * 1_000_000) });
-      videoEncoder.encode(frame, { keyFrame: frameIdx % 60 === 0 });
-      frame.close();
-      frameIdx++;
+        ctx.drawImage(ev, 0, 0, outW, outH);
+        const cap = captions.find(c => t >= c.start && t <= c.end) ?? null;
+        if (cap) drawCaptionFrame(ctx, outW, outH, cap, template, t, captionScale, captionPosition);
 
-      onProgress(20 + Math.min(78, (t / duration) * 78));
+        const frame = new VideoFrame(canvas as OffscreenCanvas, { timestamp: Math.round(t * 1_000_000) });
+        videoEncoder.encode(frame, { keyFrame: frameIdx % 60 === 0 });
+        frame.close();
+        frameIdx++;
 
-      if (ev.ended || t >= duration - 0.05) finish();
-      else rvfc(ev, onFrame);
-    };
+        onProgress(10 + Math.min(88, (t / duration) * 88));
 
-    ev.onended = finish;
-    ev.currentTime  = 0;
-    ev.playbackRate = 0.5; // 2× time budget per frame; mediaTime timestamps stay correct
-    ev.play()
-      .then(() => rvfc(ev, onFrame))
-      .catch(reject);
-  });
+        if (ev.ended || t >= duration - 0.05) finish();
+        else scheduleNext();
+      };
 
-  ev.src = "";
+      ev.onended = finish;
+      ev.currentTime  = 0;
+      ev.playbackRate = 0.25; // 4× time budget per frame at source fps
+      ev.play()
+        .then(() => rvfc(ev, onFrame))
+        .catch(fail);
+    });
+  } finally {
+    document.body.removeChild(wrapper);
+  }
+
   await videoEncoder.flush();
   if (encoderError) throw encoderError;
 
@@ -401,12 +387,30 @@ async function exportWebM(
   onProgress: (pct: number) => void,
   signal: AbortSignal
 ): Promise<Blob> {
+  // Hidden video element in a 0×0 container — in DOM so browser doesn't throttle it
+  const wrapper = document.createElement("div");
+  wrapper.style.cssText = "position:fixed;top:0;left:0;width:0;height:0;overflow:hidden;pointer-events:none;z-index:-1";
+  document.body.appendChild(wrapper);
+
+  const ev = document.createElement("video");
+  ev.src          = videoEl.src;
+  ev.muted        = false; // need audio for captureStream
+  ev.playsInline  = true;
+  ev.preload      = "auto";
+  wrapper.appendChild(ev);
+
+  await new Promise<void>((res, rej) => {
+    ev.onloadedmetadata = () => res();
+    ev.onerror          = () => rej(new Error("WebM: video failed to load"));
+    setTimeout(() => rej(new Error("WebM: video load timeout")), 15_000);
+  });
+
   const canvas = document.createElement("canvas");
   canvas.width  = outW;
   canvas.height = outH;
   const ctx = canvas.getContext("2d")!;
 
-  const rawStream    = (videoEl as unknown as { captureStream?(): MediaStream }).captureStream?.();
+  const rawStream    = (ev as unknown as { captureStream?(): MediaStream }).captureStream?.();
   const canvasStream = canvas.captureStream(fps);
   rawStream?.getAudioTracks().forEach(t => canvasStream.addTrack(t.clone()));
 
@@ -419,27 +423,41 @@ async function exportWebM(
 
   return new Promise((resolve, reject) => {
     let rafId = 0;
-    const duration = videoEl.duration || 1;
-    const stop = () => { cancelAnimationFrame(rafId); if (recorder.state !== "inactive") recorder.stop(); };
+    let stallTimer = 0;
+    let lastTime = -1;
+    const duration = ev.duration || videoEl.duration || 1;
+
+    const cleanup = () => {
+      cancelAnimationFrame(rafId);
+      clearTimeout(stallTimer);
+      if (document.body.contains(wrapper)) document.body.removeChild(wrapper);
+      ev.pause(); ev.src = "";
+      if (recorder.state !== "inactive") recorder.stop();
+    };
+
     recorder.onstop  = () => resolve(new Blob(chunks, { type: mimeType }));
-    recorder.onerror = () => reject(new Error("MediaRecorder error"));
-    signal.addEventListener("abort", () => { stop(); reject(new DOMException("Aborted", "AbortError")); });
+    recorder.onerror = () => { cleanup(); reject(new Error("MediaRecorder error")); };
+    signal.addEventListener("abort", () => { cleanup(); reject(new DOMException("Aborted", "AbortError")); });
 
     const drawLoop = () => {
       if (signal.aborted) return;
-      const t = videoEl.currentTime;
+      const t = ev.currentTime;
       onProgress(Math.min(98, (t / duration) * 100));
-      ctx.drawImage(videoEl, 0, 0, outW, outH);
+      ctx.drawImage(ev, 0, 0, outW, outH);
       const cap = captions.find(c => t >= c.start && t <= c.end) ?? null;
       if (cap) drawCaptionFrame(ctx, outW, outH, cap, template, t, captionScale, captionPosition);
-      if (!videoEl.ended) rafId = requestAnimationFrame(drawLoop);
-      else { stop(); onProgress(100); }
+
+      // Stall watchdog: if time hasn't advanced in 8 s, the video is stuck — finish up
+      if (t !== lastTime) { lastTime = t; clearTimeout(stallTimer); stallTimer = window.setTimeout(() => { cleanup(); onProgress(100); }, 8_000); }
+
+      if (!ev.ended) rafId = requestAnimationFrame(drawLoop);
+      else { cleanup(); onProgress(100); }
     };
 
+    ev.onended = () => { cleanup(); onProgress(100); };
     recorder.start(100);
-    videoEl.currentTime = 0;
-    videoEl.play().then(() => { rafId = requestAnimationFrame(drawLoop); }).catch(reject);
-    videoEl.onended = () => { stop(); onProgress(100); };
+    ev.currentTime = 0;
+    ev.play().then(() => { rafId = requestAnimationFrame(drawLoop); }).catch(reject);
   });
 }
 
@@ -458,7 +476,8 @@ export async function exportVideoWithCaptions(
   resolution: ExportResolution,
   fps: ExportFPS,
   onProgress: (pct: number) => void,
-  signal: AbortSignal
+  signal: AbortSignal,
+  onWarning?: (msg: string) => void
 ): Promise<{ blob: Blob; ext: string }> {
   const res = EXPORT_RESOLUTIONS[resolution];
   const { w: outW, h: outH } = computeDimensions(videoEl, res.maxLongSide);
@@ -468,10 +487,10 @@ export async function exportVideoWithCaptions(
       const blob = await exportMP4(videoEl, captions, template, captionScale, captionPosition, outW, outH, fps, res.bitrate, onProgress, signal);
       return { blob, ext: "mp4" };
     } catch (e) {
-      // If aborted, rethrow
       if (e instanceof DOMException && e.name === "AbortError") throw e;
-      // Otherwise fall through to WebM
-      console.warn("MP4 export failed, falling back to WebM:", e);
+      const reason = e instanceof Error ? e.message : String(e);
+      console.warn("MP4 export failed, falling back to WebM:", reason);
+      onWarning?.(`MP4 failed (${reason}) — exporting as WebM instead`);
     }
   }
 
